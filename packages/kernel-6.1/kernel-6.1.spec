@@ -46,6 +46,8 @@ Patch1004: 1004-af_unix-increase-default-max_dgram_qlen-to-512.patch
 # Drop AL revert of upstream patch to minimize delta. The necessary dependency
 # options for nvidia are instead included through DRM_SIMPLE
 Patch1005: 1005-Revert-Revert-drm-fb_helper-improve-CONFIG_FB-depend.patch
+# Build mq-delay module
+Patch1501: 1501-mq-delay-modules.patch
 
 BuildRequires: bc
 BuildRequires: elfutils-devel
@@ -486,6 +488,7 @@ install -p -m 0644 %{S:302} %{buildroot}%{_cross_bootconfigdir}/05-metal.conf
 %{_cross_kmoddir}/modules.symbols
 %{_cross_kmoddir}/modules.symbols.bin
 %{_cross_kmoddir}/System.map
+%{_cross_kmoddir}/kernel/block/mq-delay.ko.gz
 
 %if "%{_cross_arch}" == "x86_64"
 %{_cross_kmoddir}/kernel/arch/x86/crypto/blowfish-x86_64.ko.*
