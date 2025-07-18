@@ -1,0 +1,999 @@
+diff --git a/block/mq-delay.c b/block/mq-delay.c
+new file mode 100644
+index 000000000..e1c43fcd6
+--- /dev/null
++++ b/block/mq-delay.c
+@@ -0,0 +1,982 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ *  MQ Delay i/o scheduler - adaptation of the legacy deadline scheduler,
++ *  for the blk-mq scheduling framework
++ *
++ */
++#include <linux/blkdev.h>
++#include <linux/version.h>
++#include <linux/pid_namespace.h>
++#include <linux/nsproxy.h>
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 16, 0)
++#include <linux/elevator.h>
++#else
++#include "elevator.h"
++#endif
++
++#include <linux/module.h>
++#include <linux/blk-mq.h>
++#include <linux/list.h>
++#include <linux/spinlock.h>
++#include <linux/hrtimer.h>
++#include <linux/sysfs.h>
++
++/* Configuration limits */
++#define MQ_DELAY_MAX_US 3600000000U /* Maximum delay of 1 hour in microseconds */
++#define MAX_PERCENTILE_BRACKETS 10   /* Maximum number of latency percentile brackets */
++
++void mq_delay_sync_pid_lists(struct request_queue *q, struct list_head *src_list);
++
++// Add global configuration structure
++struct mq_delay_data
++{
++    struct request_queue *queue;
++    unsigned int read_delay_us;
++    unsigned int write_delay_us;
++    spinlock_t lock;
++    // List of PID namespaces that should have I/O delays applied
++    struct list_head pid_ns_list;
++};
++
++// Structure to hold PID namespace IDs for delay targeting
++struct mq_delay_pid_entry {
++    unsigned int pid_ns_id;  // PID namespace inode number
++
++    // Fixed delay values
++    unsigned int read_delay_us;
++    unsigned int write_delay_us;
++
++    // Percentage mode configuration
++    bool percentage_mode;
++
++    // Arrays for read percentage brackets (values in tenths of percent, 1 = 0.1%)
++    unsigned int read_latencies[MAX_PERCENTILE_BRACKETS];
++    unsigned int read_percentages[MAX_PERCENTILE_BRACKETS];
++    unsigned int num_read_brackets;
++
++    // Arrays for write percentage brackets
++    unsigned int write_latencies[MAX_PERCENTILE_BRACKETS];
++    unsigned int write_percentages[MAX_PERCENTILE_BRACKETS];
++    unsigned int num_write_brackets;
++
++    struct list_head list;
++};
++
++// Private data for each hardware queue
++struct mq_delay_hctx_data
++{
++    struct list_head queue; // mq_delay queue
++    struct rb_root delayed_requests;
++    struct hrtimer dispatch_timer;
++    struct blk_mq_hw_ctx *hctx;
++    unsigned int read_delay_us;
++    unsigned int write_delay_us;
++    spinlock_t lock; // Queue lock
++    // Local copy of PID namespace list for this hardware context
++    struct list_head pid_ns_list;
++};
++
++// Add module parameters
++static unsigned int read_delay_us = 0;
++module_param(read_delay_us, uint, 0644);
++MODULE_PARM_DESC(read_delay_us, "Read request delay in microseconds");
++
++static unsigned int write_delay_us = 0;
++module_param(write_delay_us, uint, 0644);
++MODULE_PARM_DESC(write_delay_us, "Write request delay in microseconds");
++
++static struct elevator_type mq_delay_scheduler;
++
++static struct kmem_cache *mq_delay_pid_cache;
++
++/* Callback from inside blk_mq_rq_ctx_init(). */
++static void mq_delay_prepare_request(struct request *rq)
++{
++    rq->elv.priv[0] = NULL;
++}
++
++#define MQ_DELAY_DISPATCH_TIME(rq) ((ktime_t)(unsigned long)rq->elv.priv[0])
++#define MQ_DELAY_DISPATCH_TIME_SET(rq, time) (rq->elv.priv[0] = (void *)(unsigned long)(time))
++#define MQ_DELAY_PID_NS_ID(rq) ((unsigned int)(unsigned long)rq->elv.priv[1])
++#define MQ_DELAY_PID_NS_ID_SET(rq, id) (rq->elv.priv[1] = (void *)(unsigned long)(id))
++
++static void mq_delay_insert_delayed_request(struct mq_delay_hctx_data *hctx_data, struct request *rq)
++{
++    struct rb_node **p = &hctx_data->delayed_requests.rb_node;
++    struct rb_node *parent = NULL;
++
++    while (*p)
++    {
++        struct request *this_rq = rb_entry((void *)(*p), struct request, rb_node);
++        parent = *p;
++
++        if (ktime_before(MQ_DELAY_DISPATCH_TIME(rq), MQ_DELAY_DISPATCH_TIME(this_rq)))
++            p = &((*p)->rb_left);
++        else
++            p = &((*p)->rb_right);
++    }
++    rb_link_node(&rq->rb_node, parent, p);
++    rb_insert_color(&rq->rb_node, &hctx_data->delayed_requests);
++}
++
++// Helper function to determine delay based on percentages
++static unsigned int get_delay_by_percentage(struct mq_delay_pid_entry *entry, int rw)
++{
++    unsigned int *latencies, *percentages;
++    unsigned int num_brackets;
++    unsigned int rand_val;
++    int i;
++    u16 rand_bytes;
++    unsigned int cumulative;
++
++    if (rw == READ) {
++        latencies = entry->read_latencies;
++        percentages = entry->read_percentages;
++        num_brackets = entry->num_read_brackets;
++    } else {
++        latencies = entry->write_latencies;
++        percentages = entry->write_percentages;
++        num_brackets = entry->num_write_brackets;
++    }
++
++    if (num_brackets == 0)
++        return 0;
++
++    // Generate random value between 0-999 for percentage determination (0.1% precision)
++    get_random_bytes(&rand_bytes, sizeof(rand_bytes));
++    rand_val = (rand_bytes * 1000) >> 16; // Fast division for 0-999 range
++
++    // Find which percentage bracket this request falls into
++    cumulative = 0;
++    for (i = 0; i < num_brackets; i++) {
++        // Check for potential overflow
++        if (cumulative > UINT_MAX - percentages[i]) {
++            pr_warn("mq-delay: percentage sum overflow detected\n");
++            return 0;
++        }
++        cumulative += percentages[i];
++        if (rand_val < cumulative)
++            return latencies[i];
++    }
++
++    // Default: no delay
++    return 0;
++}
++
++// Insert request
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 16)
++static void mq_delay_insert_requests(struct blk_mq_hw_ctx *hctx,
++                                     struct list_head *list, bool at_head)
++#else
++static void mq_delay_insert_requests(struct blk_mq_hw_ctx *hctx,
++                                     struct list_head *list, blk_insert_t flags)
++#endif
++{
++    struct mq_delay_hctx_data *hctx_data = hctx->sched_data;
++    struct request *rq, *next;
++    struct mq_delay_pid_entry *entry;
++    ktime_t now = ktime_get();
++    unsigned int delay = 0;
++    unsigned int current_pid_ns_id = task_active_pid_ns(current)->ns.inum;
++    bool found_ns = false;
++
++    spin_lock(&hctx_data->lock);
++
++    list_for_each_entry_safe(rq, next, list, queuelist) {
++        list_del_init(&rq->queuelist);
++
++        // Default to global delay values
++        delay = rq_data_dir(rq) == READ ?
++                hctx_data->read_delay_us :
++                hctx_data->write_delay_us;
++
++        // Check for PID namespace specific configuration
++        found_ns = false;
++        list_for_each_entry(entry, &hctx_data->pid_ns_list, list) {
++            if (entry->pid_ns_id == current_pid_ns_id) {
++                found_ns = true;
++                if (entry->percentage_mode) {
++                    // Use percentage-based delay
++                    delay = get_delay_by_percentage(entry, rq_data_dir(rq));
++                } else {
++                    // Use fixed delay
++                    delay = rq_data_dir(rq) == READ ?
++                            entry->read_delay_us :
++                            entry->write_delay_us;
++                }
++                break;
++            }
++        }
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)
++        if (at_head || delay == 0)
++#else
++        if ((flags & BLK_MQ_INSERT_AT_HEAD) || delay == 0)
++#endif
++        {
++            MQ_DELAY_DISPATCH_TIME_SET(rq, now);
++        }
++        else
++        {
++            MQ_DELAY_DISPATCH_TIME_SET(rq, ktime_add_us(now, delay));
++            MQ_DELAY_PID_NS_ID_SET(rq, current_pid_ns_id);
++        }
++
++        mq_delay_insert_delayed_request(hctx_data, rq);
++    }
++
++    spin_unlock(&hctx_data->lock);
++}
++
++static enum hrtimer_restart mq_delay_dispatch_timer_callback(struct hrtimer *timer)
++{
++    struct mq_delay_hctx_data *hctx_data = container_of(timer, struct mq_delay_hctx_data, dispatch_timer);
++    blk_mq_run_hw_queue(hctx_data->hctx, true);
++    return HRTIMER_NORESTART;
++}
++
++// Dispatch request
++static struct request *mq_delay_dispatch_request(struct blk_mq_hw_ctx *hctx)
++{
++    struct mq_delay_hctx_data *hctx_data = hctx->sched_data;
++    struct request *rq = NULL;
++    ktime_t now = ktime_get();
++    ktime_t dispatch_time = 0;
++
++    spin_lock(&hctx_data->lock);
++
++    if (!RB_EMPTY_ROOT(&hctx_data->delayed_requests))
++    {
++        struct rb_node *first = rb_first(&hctx_data->delayed_requests);
++        rq = rb_entry((void *)first, struct request, rb_node);
++
++        // Check if it's time to dispatch
++        dispatch_time = MQ_DELAY_DISPATCH_TIME(rq);
++        if (ktime_after(now, dispatch_time))
++        {
++            elv_rb_del(&hctx_data->delayed_requests, rq);
++        }
++        else
++        {
++            rq = NULL;
++            hrtimer_start(&hctx_data->dispatch_timer, dispatch_time, HRTIMER_MODE_ABS_PINNED);
++        }
++    }
++
++    spin_unlock(&hctx_data->lock);
++    return rq;
++}
++
++static void mq_delay_finish_request(struct request *rq)
++{
++    rq->elv.priv[0] = NULL;
++}
++
++static bool mq_delay_has_work(struct blk_mq_hw_ctx *hctx)
++{
++    struct mq_delay_hctx_data *hctx_data = hctx->sched_data;
++    return !RB_EMPTY_ROOT(&hctx_data->delayed_requests);
++}
++
++// Init hardware queue context
++static int mq_delay_init_hctx(struct blk_mq_hw_ctx *hctx, unsigned int hctx_idx)
++{
++    struct mq_delay_data *data = hctx->queue->elevator->elevator_data;
++    struct mq_delay_hctx_data *hctx_data;
++
++    hctx_data = kzalloc_node(sizeof(*hctx_data), GFP_KERNEL, hctx->numa_node);
++    if (!hctx_data)
++        return -ENOMEM;
++
++    hrtimer_init(&hctx_data->dispatch_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS_PINNED);
++    hctx_data->dispatch_timer.function = mq_delay_dispatch_timer_callback;
++
++    hctx_data->delayed_requests = RB_ROOT;
++    spin_lock_init(&hctx_data->lock);
++    INIT_LIST_HEAD(&hctx_data->pid_ns_list);
++    hctx_data->hctx = hctx;
++
++    // Initialize delays from global configuration
++    hctx_data->read_delay_us = data->read_delay_us;
++    hctx_data->write_delay_us = data->write_delay_us;
++
++    hctx->sched_data = hctx_data;
++    return 0;
++}
++
++// Exit hardware queue context
++static void mq_delay_exit_hctx(struct blk_mq_hw_ctx *hctx, unsigned int hctx_idx)
++{
++    struct mq_delay_hctx_data *hctx_data = hctx->sched_data;
++    struct mq_delay_pid_entry *entry, *tmp;
++
++    if (!hctx_data)
++        return;
++
++    hrtimer_cancel(&hctx_data->dispatch_timer);
++
++    // Clean up local PID namespace list
++    list_for_each_entry_safe(entry, tmp, &hctx_data->pid_ns_list, list) {
++        list_del(&entry->list);
++        kmem_cache_free(mq_delay_pid_cache, entry);
++    }
++
++    kfree(hctx_data);
++}
++
++// Init scheduler
++static int mq_delay_init(struct request_queue *q, struct elevator_type *e)
++{
++    struct mq_delay_data *data;
++    struct elevator_queue *eq;
++
++    eq = elevator_alloc(q, e);
++    if (!eq) {
++        pr_err("mq-delay: failed to allocate elevator\n");
++        return -ENOMEM;
++    }
++
++    data = kzalloc(sizeof(*data), GFP_KERNEL);
++    if (!data)
++    {
++        kobject_put(&eq->kobj);
++        return -ENOMEM;
++    }
++
++    spin_lock_init(&data->lock);
++    INIT_LIST_HEAD(&data->pid_ns_list);
++    data->read_delay_us = read_delay_us;
++    data->write_delay_us = write_delay_us;
++    data->queue = q;
++
++    eq->elevator_data = data;
++    q->elevator = eq;
++    return 0;
++}
++
++// Exit scheduler
++static void mq_delay_exit(struct elevator_queue *e)
++{
++    struct mq_delay_data *data = e->elevator_data;
++    struct mq_delay_pid_entry *entry, *tmp;
++
++    if (data) {
++        list_for_each_entry_safe(entry, tmp, &data->pid_ns_list, list) {
++            list_del(&entry->list);
++            kmem_cache_free(mq_delay_pid_cache, entry);
++        }
++        kfree(data);
++        e->elevator_data = NULL;
++    }
++}
++
++// Add sysfs handlers
++static ssize_t read_delay_us_show(struct elevator_queue *e, char *page)
++{
++    struct mq_delay_data *data = e->elevator_data;
++    return sprintf(page, "%u\n", data->read_delay_us);
++}
++
++static ssize_t read_delay_us_store(struct elevator_queue *e, const char *page, size_t count)
++{
++    struct mq_delay_data *data = e->elevator_data;
++    struct blk_mq_hw_ctx *hctx;
++    unsigned int value;
++    unsigned long i;
++
++    if (kstrtouint(page, 10, &value))
++        return -EINVAL;
++
++    /* Validate input */
++    if (value > MQ_DELAY_MAX_US)
++        return -EINVAL;
++
++    spin_lock(&data->lock);
++    data->read_delay_us = value;
++    spin_unlock(&data->lock);
++
++    queue_for_each_hw_ctx(data->queue, hctx, i)
++    {
++        struct mq_delay_hctx_data *hctx_data = hctx->sched_data;
++        if (hctx_data)
++        {
++            spin_lock(&hctx_data->lock);
++            hctx_data->read_delay_us = value;
++            spin_unlock(&hctx_data->lock);
++        }
++    }
++
++    return count;
++}
++
++// Similar handlers for write_delay_us
++static ssize_t write_delay_us_show(struct elevator_queue *e, char *page)
++{
++    struct mq_delay_data *data = e->elevator_data;
++    return sprintf(page, "%u\n", data->write_delay_us);
++}
++
++static ssize_t write_delay_us_store(struct elevator_queue *e, const char *page, size_t count)
++{
++    struct mq_delay_data *data = e->elevator_data;
++    struct blk_mq_hw_ctx *hctx;
++    unsigned int value;
++    unsigned long i;
++
++    if (kstrtouint(page, 10, &value))
++        return -EINVAL;
++
++    /* Validate input */
++    if (value > MQ_DELAY_MAX_US)
++        return -EINVAL;
++
++    spin_lock(&data->lock);
++    data->write_delay_us = value;
++    spin_unlock(&data->lock);
++
++    queue_for_each_hw_ctx(data->queue, hctx, i)
++    {
++        struct mq_delay_hctx_data *hctx_data = hctx->sched_data;
++        if (hctx_data)
++        {
++            spin_lock(&hctx_data->lock);
++            hctx_data->write_delay_us = value;
++            spin_unlock(&hctx_data->lock);
++        }
++    }
++
++    return count;
++}
++
++// Helper function to parse percentage configurations with 0.1% precision
++static bool parse_percentage_config(struct mq_delay_pid_entry *entry,
++                                  const char *config, bool is_read)
++{
++    char *buf, *cursor, *token;
++    unsigned int latency;
++    int idx = 0;
++    unsigned int total_percentage = 0;
++    unsigned int percentage_tenths = 0;
++    char *decimal_point;
++    int decimal_part = 0;
++
++    // Save original bracket count to restore on error
++    unsigned int original_bracket_count = is_read ?
++                                        entry->num_read_brackets :
++                                        entry->num_write_brackets;
++
++    // Make a copy since strsep modifies the string
++    buf = kstrdup(config, GFP_ATOMIC);
++    if (!buf)
++        return false;
++
++    cursor = buf;
++
++    // Reset the brackets count for new parsing
++    if (is_read)
++        entry->num_read_brackets = 0;
++    else
++        entry->num_write_brackets = 0;
++
++    // Format should be "lat1,pct1,lat2,pct2,..."
++    while ((token = strsep(&cursor, ",")) != NULL && idx < MAX_PERCENTILE_BRACKETS * 2) {
++        if (idx % 2 == 0) {
++            // Even positions are latencies
++            if (kstrtouint(token, 10, &latency) || latency > MQ_DELAY_MAX_US)
++                goto parse_error;
++
++            if (is_read)
++                entry->read_latencies[idx/2] = latency;
++            else
++                entry->write_latencies[idx/2] = latency;
++        } else {
++            // Odd positions are percentages (now supporting decimal points)
++            decimal_point = strchr(token, '.');
++            if (decimal_point) {
++                // Temporarily replace decimal with null terminator
++                *decimal_point = '\0';
++
++                // Parse integer part
++                if (kstrtouint(token, 10, &percentage_tenths))
++                    goto parse_error;
++
++                // Parse decimal part (only considers first decimal place)
++                if (*(decimal_point + 1) != '\0') {
++                    decimal_part = *(decimal_point + 1) - '0';
++                    if (decimal_part < 0 || decimal_part > 9)
++                        goto parse_error;
++                } else {
++                    decimal_part = 0;
++                }
++
++                // Convert to tenths (1.5% becomes 15)
++                percentage_tenths = percentage_tenths * 10 + decimal_part;
++            } else {
++                // No decimal point, convert directly to tenths
++                if (kstrtouint(token, 10, &percentage_tenths))
++                    goto parse_error;
++
++                percentage_tenths *= 10; // Convert to tenths (5% becomes 50)
++            }
++
++            // Validate percentage (0% to 100%)
++            if (percentage_tenths > 1000)  // Only check for upper bound
++                goto parse_error;
++
++            total_percentage += percentage_tenths;
++            if (total_percentage > 1000) // Total must not exceed 100.0%
++                goto parse_error;
++
++            if (is_read)
++                entry->read_percentages[idx/2] = percentage_tenths;
++            else
++                entry->write_percentages[idx/2] = percentage_tenths;
++
++            // Increment bracket count after processing a complete pair
++            if (is_read)
++                entry->num_read_brackets = (idx+1)/2;
++            else
++                entry->num_write_brackets = (idx+1)/2;
++        }
++        idx++;
++    }
++
++    kfree(buf);
++    return true;
++
++parse_error:
++    // Restore original bracket count on error
++    if (is_read)
++        entry->num_read_brackets = original_bracket_count;
++    else
++        entry->num_write_brackets = original_bracket_count;
++
++    kfree(buf);
++    return false;
++}
++
++static ssize_t delay_controls_show(struct elevator_queue *e, char *page)
++{
++    struct mq_delay_data *data = e->elevator_data;
++    struct mq_delay_pid_entry *entry;
++    ssize_t offset = 0;
++    int i;
++
++    spin_lock(&data->lock);
++    list_for_each_entry(entry, &data->pid_ns_list, list) {
++        if (entry->percentage_mode) {
++            // Format for percentage mode
++            offset += scnprintf(page + offset, PAGE_SIZE - offset,
++                              "%u p read ", entry->pid_ns_id);
++
++            // Add read percentages
++            for (i = 0; i < entry->num_read_brackets; i++) {
++                offset += scnprintf(page + offset, PAGE_SIZE - offset,
++                                  "%u,%u.%u%s",
++                                  entry->read_latencies[i],
++                                  entry->read_percentages[i] / 10,  // Integer part
++                                  entry->read_percentages[i] % 10,  // Decimal part
++                                  i < entry->num_read_brackets - 1 ? "," : "");
++            }
++
++            offset += scnprintf(page + offset, PAGE_SIZE - offset, " write ");
++
++            // Add write percentages
++            for (i = 0; i < entry->num_write_brackets; i++) {
++                offset += scnprintf(page + offset, PAGE_SIZE - offset,
++                                  "%u,%u.%u%s",
++                                  entry->write_latencies[i],
++                                  entry->write_percentages[i] / 10,  // Integer part
++                                  entry->write_percentages[i] % 10,  // Decimal part
++                                  i < entry->num_write_brackets - 1 ? "," : "");
++            }
++
++            offset += scnprintf(page + offset, PAGE_SIZE - offset, "\n");
++        } else {
++            // Format for fixed mode (original format)
++            offset += scnprintf(page + offset, PAGE_SIZE - offset,
++                              "%u %u %u\n",
++                              entry->pid_ns_id,
++                              entry->read_delay_us,
++                              entry->write_delay_us);
++        }
++    }
++    spin_unlock(&data->lock);
++
++    return offset;
++}
++
++#define MAX_TRACKED_NS 100
++static void mq_delay_clear_delayed_requests_for_ns(struct mq_delay_hctx_data *hctx_data, unsigned int pid_ns_id);
++
++static ssize_t delay_controls_store(struct elevator_queue *e, const char *page, size_t count)
++{
++    struct mq_delay_data *data = e->elevator_data;
++    struct mq_delay_pid_entry *entry, *tmp;
++    unsigned int pid_ns_id, read_delay, write_delay;
++    size_t current_size = 0;
++    int ret;
++    bool found = false;
++    char mode_flag;
++    char read_config[256], write_config[256];
++
++    if (!capable(CAP_SYS_ADMIN))
++        return -EPERM;
++
++    // Format 1: "-pid_ns_id" to delete a policy
++    if (sscanf(page, "-%u", &pid_ns_id) == 1) {
++        struct blk_mq_hw_ctx *hctx;
++        unsigned long i;
++
++        spin_lock(&data->lock);
++
++        // First verify the entry exists
++        list_for_each_entry(entry, &data->pid_ns_list, list) {
++            if (entry->pid_ns_id == pid_ns_id) {
++                found = true;
++                break;
++            }
++        }
++
++        if (!found) {
++            spin_unlock(&data->lock);
++            return count;
++        }
++
++        // Clear delayed requests before removing the entry
++        queue_for_each_hw_ctx(data->queue, hctx, i) {
++            struct mq_delay_hctx_data *hctx_data = hctx->sched_data;
++            if (hctx_data) {
++                mq_delay_clear_delayed_requests_for_ns(hctx_data, pid_ns_id);
++            }
++        }
++
++        // Now remove the entry
++        list_for_each_entry_safe(entry, tmp, &data->pid_ns_list, list) {
++            if (entry->pid_ns_id == pid_ns_id) {
++                list_del(&entry->list);
++                kmem_cache_free(mq_delay_pid_cache, entry);
++                break;
++            }
++        }
++
++        mq_delay_sync_pid_lists(data->queue, &data->pid_ns_list);
++        spin_unlock(&data->lock);
++        return count;
++    }
++
++    // Format 3: "pid_ns_id p read lat1,pct1,lat2,pct2... write lat1,pct1,lat2,pct2..."
++    // For percentage-based configuration
++    if (sscanf(page, "%u %c read %255s write %255s", &pid_ns_id, &mode_flag, read_config, write_config) == 4 &&
++        mode_flag == 'p') {
++
++        // Process read and write percentage configurations
++        bool success = true;
++
++        spin_lock(&data->lock);
++
++        // Check if we already have an entry for this PID namespace
++        list_for_each_entry(entry, &data->pid_ns_list, list) {
++            if (entry->pid_ns_id == pid_ns_id) {
++                found = true;
++                break;
++            }
++        }
++
++        // Limit the number of tracked namespaces to prevent memory exhaustion
++        if (!found) {
++            list_for_each_entry(entry, &data->pid_ns_list, list) {
++                current_size++;
++            }
++            if (current_size >= MAX_TRACKED_NS) {
++                spin_unlock(&data->lock);
++                return -ENOSPC;
++            }
++
++            // Create new entry
++            entry = kmem_cache_alloc(mq_delay_pid_cache, GFP_ATOMIC);
++            if (!entry) {
++                spin_unlock(&data->lock);
++                return -ENOMEM;
++            }
++            memset(entry, 0, sizeof(*entry));
++            entry->pid_ns_id = pid_ns_id;
++            list_add(&entry->list, &data->pid_ns_list);
++        }
++
++
++        // Parse read percentages
++        success = parse_percentage_config(entry, read_config, true);
++
++        // Parse write percentages
++        if (success)
++            success = parse_percentage_config(entry, write_config, false);
++
++        if (!success) {
++            if (!found) {
++                // If new entry and parsing failed, free it
++                list_del(&entry->list);
++                kmem_cache_free(mq_delay_pid_cache, entry);
++            }
++            spin_unlock(&data->lock);
++            return -EINVAL;
++        }
++
++        // Configure percentage mode
++        entry->percentage_mode = true;
++
++        // Propagate changes to all hardware contexts
++        mq_delay_sync_pid_lists(data->queue, &data->pid_ns_list);
++
++        spin_unlock(&data->lock);
++        return count;
++    }
++
++    // Format 2: "pid_ns_id read_delay write_delay" to add/update a fixed-delay policy
++    ret = sscanf(page, "%u %u %u", &pid_ns_id, &read_delay, &write_delay);
++    if (ret != 3)
++        return -EINVAL;
++
++    /* Validate input: delays must not exceed maximum allowed value */
++    if (read_delay > MQ_DELAY_MAX_US || write_delay > MQ_DELAY_MAX_US)
++        return -EINVAL;
++
++    spin_lock(&data->lock);
++
++    // First try to update existing entry
++    list_for_each_entry(entry, &data->pid_ns_list, list) {
++        if (entry->pid_ns_id == pid_ns_id) {
++            entry->percentage_mode = false;  // Switch to fixed-delay mode
++            entry->read_delay_us = read_delay;
++            entry->write_delay_us = write_delay;
++            // Clear percentage arrays
++            entry->num_read_brackets = 0;
++            entry->num_write_brackets = 0;
++            found = true;
++            break;
++        }
++    }
++
++    // Limit the number of tracked namespaces to prevent memory exhaustion
++    if (!found) {
++        list_for_each_entry(entry, &data->pid_ns_list, list) {
++            current_size++;
++        }
++        if (current_size >= MAX_TRACKED_NS) {
++            spin_unlock(&data->lock);
++            return -ENOSPC;
++        }
++
++        // Create new entry if not found
++        entry = kmem_cache_alloc(mq_delay_pid_cache, GFP_ATOMIC);
++        if (!entry) {
++            spin_unlock(&data->lock);
++            return -ENOMEM;
++        }
++        memset(entry, 0, sizeof(*entry));
++
++        entry->pid_ns_id = pid_ns_id;
++        entry->read_delay_us = read_delay;
++        entry->write_delay_us = write_delay;
++        entry->percentage_mode = false;  // Start in fixed-delay mode
++        list_add(&entry->list, &data->pid_ns_list);
++    }
++
++    // Propagate changes to all hardware contexts
++    mq_delay_sync_pid_lists(data->queue, &data->pid_ns_list);
++
++    spin_unlock(&data->lock);
++    return count;
++}
++
++static unsigned int mq_delay_count_delayed_requests(struct mq_delay_hctx_data *hctx_data)
++{
++    struct rb_node *node;
++    unsigned int count = 0;
++
++    spin_lock(&hctx_data->lock);
++    for (node = rb_first(&hctx_data->delayed_requests); node; node = rb_next(node)) {
++        count++;
++    }
++    spin_unlock(&hctx_data->lock);
++
++    return count;
++}
++
++// Add a new sysfs attribute to show inflight count
++static ssize_t delayed_requests_show(struct elevator_queue *e, char *page)
++{
++    struct mq_delay_data *data = e->elevator_data;
++    struct blk_mq_hw_ctx *hctx;
++    unsigned long i;
++    unsigned int total_count = 0;
++
++    queue_for_each_hw_ctx(data->queue, hctx, i) {
++        struct mq_delay_hctx_data *hctx_data = hctx->sched_data;
++        if (hctx_data) {
++            total_count += mq_delay_count_delayed_requests(hctx_data);
++        }
++    }
++
++    return sprintf(page, "%u\n", total_count);
++}
++
++// Update the elevator attributes array
++static struct elv_fs_entry mq_delay_attrs[] = {
++    __ATTR(read_delay_us, 0644, read_delay_us_show, read_delay_us_store),
++    __ATTR(write_delay_us, 0644, write_delay_us_show, write_delay_us_store),
++    __ATTR(delay_controls, 0644, delay_controls_show, delay_controls_store),
++    __ATTR(delayed_requests, 0444, delayed_requests_show, NULL),
++    __ATTR_NULL
++};
++
++static struct elevator_type mq_delay_scheduler = {
++    .ops = {
++        .init_sched = mq_delay_init,
++        .init_hctx = mq_delay_init_hctx,
++        .prepare_request = mq_delay_prepare_request,
++        .insert_requests = mq_delay_insert_requests,
++        .dispatch_request = mq_delay_dispatch_request,
++        .finish_request = mq_delay_finish_request,
++        .has_work = mq_delay_has_work,
++        .exit_hctx = mq_delay_exit_hctx,
++        .exit_sched = mq_delay_exit,
++    },
++    .elevator_attrs = mq_delay_attrs,
++    .elevator_name = "mq-delay",
++    .elevator_owner = THIS_MODULE,
++};
++
++static int __init mq_delay_init_module(void)
++{
++    /* Validate module parameters */
++    if (read_delay_us > MQ_DELAY_MAX_US || write_delay_us > MQ_DELAY_MAX_US)
++    {
++        pr_err("mq-delay: delay values must not exceed %u us\n", MQ_DELAY_MAX_US);
++        return -EINVAL;
++    }
++
++    // Create SLAB cache for PID namespace entries
++    mq_delay_pid_cache = kmem_cache_create("mq_delay_pid_cache",
++                                          sizeof(struct mq_delay_pid_entry),
++                                          0, 0, NULL);
++    if (!mq_delay_pid_cache)
++        return -ENOMEM;
++
++    return elv_register(&mq_delay_scheduler);
++}
++
++static void __exit mq_delay_exit_module(void)
++{
++    kmem_cache_destroy(mq_delay_pid_cache);
++    elv_unregister(&mq_delay_scheduler);
++}
++
++module_init(mq_delay_init_module);
++module_exit(mq_delay_exit_module);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("test-infra");
++MODULE_DESCRIPTION("The mq-delay I/O scheduler with configurable delays for reads and writes");
++
++void mq_delay_sync_pid_lists(struct request_queue *q, struct list_head *src_list)
++{
++    struct blk_mq_hw_ctx *hctx;
++    struct mq_delay_pid_entry *entry, *new_entry;
++    unsigned long i;
++
++    queue_for_each_hw_ctx(q, hctx, i) {
++        struct mq_delay_hctx_data *hctx_data = hctx->sched_data;
++        if (!hctx_data)
++            continue;
++
++        // Clear existing list
++        spin_lock(&hctx_data->lock);
++        while (!list_empty(&hctx_data->pid_ns_list)) {
++            entry = list_first_entry(&hctx_data->pid_ns_list,
++                                   struct mq_delay_pid_entry, list);
++            list_del(&entry->list);
++            kmem_cache_free(mq_delay_pid_cache, entry);
++        }
++
++        // Copy new entries with all their configuration
++        list_for_each_entry(entry, src_list, list) {
++            new_entry = kmem_cache_alloc(mq_delay_pid_cache, GFP_ATOMIC);
++            if (!new_entry) {
++                pr_warn("mq-delay: failed to allocate PID entry for hctx %lu\n", i);
++                continue;
++            }
++
++            // Copy all fields, including percentage mode configuration
++            memcpy(new_entry, entry, sizeof(struct mq_delay_pid_entry));
++            INIT_LIST_HEAD(&new_entry->list);  // Initialize list entry
++            list_add(&new_entry->list, &hctx_data->pid_ns_list);
++        }
++        spin_unlock(&hctx_data->lock);
++    }
++}
++
++// Add this new helper function
++static void mq_delay_clear_delayed_requests_for_ns(struct mq_delay_hctx_data *hctx_data, unsigned int pid_ns_id)
++{
++    struct rb_node *node, *next;
++    struct request *rq;
++    LIST_HEAD(dispatch_list);
++    ktime_t now = ktime_get();
++
++    spin_lock(&hctx_data->lock);
++
++    // Iterate through all delayed requests
++    for (node = rb_first(&hctx_data->delayed_requests); node; node = next) {
++        next = rb_next(node);
++        rq = rb_entry(node, struct request, rb_node);
++
++        // Check if request belongs to the target namespace
++        if (MQ_DELAY_PID_NS_ID(rq) == pid_ns_id) {
++            // Remove from rb_tree
++            elv_rb_del(&hctx_data->delayed_requests, rq);
++            // Add to temporary list
++            list_add_tail(&rq->queuelist, &dispatch_list);
++        }
++    }
++
++    // Reinsert requests with updated dispatch time
++    while (!list_empty(&dispatch_list)) {
++        rq = list_first_entry(&dispatch_list, struct request, queuelist);
++        list_del_init(&rq->queuelist);
++        MQ_DELAY_DISPATCH_TIME_SET(rq, now);
++        mq_delay_insert_delayed_request(hctx_data, rq);
++    }
++
++    // Trigger immediate dispatch
++    hrtimer_start(&hctx_data->dispatch_timer, now, HRTIMER_MODE_ABS_PINNED);
++
++    spin_unlock(&hctx_data->lock);
++}
++
++/*
++ * The mq-delay scheduler implements I/O request delays based on PID namespaces.
++ * Delays can be configured separately for read and write operations.
++ *
++ * Sysfs interface:
++ * - read_delay_us  : Default delay for read requests (0-3600000000us)
++ * - write_delay_us : Default delay for write requests (0-3600000000us)
++ * - delay_controls : Configure delays for specific PID namespaces
++ *
++ * delay_controls supports three formats:
++ * 1. "pid_ns_id read_delay write_delay"
++ *    - Fixed delays for a specific PID namespace
++ *
++ * 2. "pid_ns_id p read lat1,pct1,lat2,pct2... write lat1,pct1,lat2,pct2..."
++ *    - Percentage-based delays where:
++ *      - lat1 = latency in microseconds for first bracket
++ *      - pct1 = percentage of I/O (0.1-100.0) that should get this latency
++ *        (supports decimal precision to 0.1%)
++ *    - Example: "4026531837 p read 1000,0.5,5000,30.5 write 10000,40,50000,10.2"
++ *      means 0.5% of reads get 1ms delay, 30.5% get 5ms, 40% of writes get 10ms,
++ *      10.2% get 50ms, and the rest get no delay
++ *
++ * 3. "-pid_ns_id"
++ *    - Remove the configuration for a specific PID namespace
++ */
+diff --git a/block/Makefile b/block/Makefile
+index 4e01bb71a..62145f426 100644
+--- a/block/Makefile
++++ b/block/Makefile
+@@ -41,3 +41,5 @@ obj-$(CONFIG_BLK_INLINE_ENCRYPTION)	+= blk-crypto.o blk-crypto-profile.o \
+ 					   blk-crypto-sysfs.o
+ obj-$(CONFIG_BLK_INLINE_ENCRYPTION_FALLBACK)	+= blk-crypto-fallback.o
+ obj-$(CONFIG_BLOCK_HOLDER_DEPRECATED)	+= holder.o
++
++obj-m += mq-delay.o
+-- 
